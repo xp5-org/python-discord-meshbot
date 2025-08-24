@@ -1,0 +1,6 @@
+# Python environment
+.env
+
+# macOS metadata
+.DS_Store
+._*
