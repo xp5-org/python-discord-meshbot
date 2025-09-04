@@ -6,18 +6,29 @@ from discord.ext import commands, tasks
 from meshtastic.tcp_interface import TCPInterface
 from pubsub import pub  # pip install pypubsub
 from discord import app_commands
+import matplotlib
+matplotlib.use("Agg")  # Must come before importing pyplot
 import matplotlib.pyplot as plt
+import aiosqlite
+import io
+import math
+import matplotlib.pyplot as plt
+import os
+import random
+
 import contextily as ctx
 import geopandas as gpd
 from shapely.geometry import Point
 import sqlite3, aiosqlite
 from dotenv import load_dotenv
 
+
+
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-center_lat = os.getenv("CENTERLAT")
-center_lon = os.getenv("CENTERLON")
+CENTER_LAT = os.getenv("CENTER_LAT")
+CENTER_LON = os.getenv("CENTER_LON")
 
 
 
@@ -29,6 +40,9 @@ HISTORY_DB_FILE = "nodes_history.db"    # full history log will become large
 INCOMING_CHANNEL_NAME = "mesh-incoming"   # channel name of where to post the messages
 NODE_REFRESH_INTERVAL = 900             # num of seconds to refresh nodedb from device
 permsinteger = "274877941760"           # discord bot pernissions for channel access
+MAX_DISTANCE_KM = 500
+OUTLIER_MARGIN = 0.85
+MY_ID = "!849a06e8"
 # ====================
 
 
@@ -103,10 +117,11 @@ class MeshSession:
                 if cache_conn is None:
                     print("[mesh] Connecting to cache database...")
                     cache_conn = sqlite3.connect(NODE_CACHE_DB)
+                    cache_conn.row_factory = sqlite3.Row  # enables dict-like rows
                     cache_cursor = cache_conn.cursor()
                     cache_cursor.execute(f"CREATE TABLE IF NOT EXISTS nodes ({CACHE_COLUMNS})")
                     cache_conn.commit()
-                    print("[mesh] Cache database ready.")
+
 
                 if history_conn is None:
                     print("[mesh] Connecting to history database...")
@@ -144,36 +159,39 @@ class MeshSession:
         print("[mesh] All database connections closed.")
 
     def _load_nodes_from_db(self, cursor):
-                # builds python object from node cache
-                with self.node_list_lock:
-                    cursor.execute("SELECT * FROM nodes")
-                    rows = cursor.fetchall()
-                    self.node_list = []
+        with self.node_list_lock:
+            cursor.execute("SELECT * FROM nodes")
+            rows = cursor.fetchall()
+            self.node_list = []
 
-                    # map database rows/cols to python dict
-                    for row in rows:
-                        node_info = {
-                            "id": row[0],
-                            "longName": row[1],
-                            "shortName": row[2],
-                            "role": row[3],
-                            "hopsAway": row[4],
-                            "snr": row[5],
-                            "batteryLevel": row[6],
-                            "voltage": row[7],
-                            "airUtilTx": row[8],
-                            "channelUtilization": row[9],
-                            "hardwareModel": row[10],
-                            "position": {"latitude": row[11], "longitude": row[12]} if row[11] is not None else None,
-                            "lastHeard": row[13],
-                            "firstSeen": row[14]
-                        }
-                        self.node_list.append((node_info["id"], node_info))
-                    
-                    self.my_node_id = next(
-                        (nid for nid, info in self.node_list if info.get("role") == "self"),
-                        None
-                    )
+            for row in rows:
+                node_info = {
+                    "id": row["id"],
+                    "longName": row["longName"],
+                    "shortName": row["shortName"],
+                    "role": row["role"],
+                    "hopsAway": row["hopsAway"],
+                    "snr": row["snr"],
+                    "batteryLevel": row["batteryLevel"],
+                    "voltage": row["voltage"],
+                    "airUtilTx": row["airUtilTx"],
+                    "channelUtilization": row["channelUtilization"],
+                    "hwModel": row["hwModel"] if row["hwModel"] is not None else row["hwModel"],
+                    "position": {
+                        "latitude": row["latitude"],
+                        "longitude": row["longitude"]
+                    } if row["latitude"] is not None else None,
+                    "lastHeard": row["lastHeard"],
+                    "firstSeen": row["firstSeen"]
+                }
+
+                self.node_list.append((node_info["id"], node_info))
+
+                self.my_node_id = next(
+                    (nid for nid, info in self.node_list if info.get("role") == "self"),
+                    None
+                )
+
 
 
     def _reader_alive(self):
@@ -207,14 +225,18 @@ class MeshSession:
         print("[mesh] Fetching and logging nodes from mesh...")
         current_time_iso = datetime.utcnow().isoformat()
         current_time_ts = int(datetime.utcnow().timestamp())
-
+        nodes_to_process = self.interface.nodes.copy()
         try:
-            for node_id, node in self.interface.nodes.items():
+            for node_id, node in nodes_to_process.items():
                 user = node.get("user", {})
                 metrics = node.get("deviceMetrics", {})
                 pos = node.get("position", {})
 
                 hops_raw = node.get("hopsAway")
+
+                if node_id == MY_ID:
+                    hops = 0
+
                 try:
                     hops = int(hops_raw)
                     if hops < 0 or hops > 99:
@@ -273,7 +295,7 @@ class MeshSession:
                 existing_first_seen = cache_cursor.fetchone()
 
                 if existing_first_seen:
-                    # Node exists → update everything except firstSeen
+                    # node exists → update everything except firstSeen
                     cache_cursor.execute("""
                         UPDATE nodes SET
                             longName=?, shortName=?, role=?, macaddr=?, hwModel=?, isLicensed=?, isConfigured=?,
@@ -353,30 +375,58 @@ class MeshSession:
             print(f"[mesh] Exception fetching nodes: {e}")
             self.online = False
 
-
+# this forwards received messages onto discord
     def on_receive(self, packet, interface):
-        # capture incoming messages from mesh device and forward to discord
         if not self.online:
             return
         try:
-            decoded = packet.get("decoded") or {}
-            if decoded.get("portnum") == "TEXT_MESSAGE_APP":
-                payload = decoded.get("payload", b"")
-                message = payload.decode("utf-8", errors="ignore")
-                fromnum = packet.get("fromId")
+            decoded_packet = packet.get('decoded', {})
+            if decoded_packet.get('portnum') == 'TEXT_MESSAGE_APP':
+                message = decoded_packet['payload'].decode('utf-8', errors='ignore')
+                fromnum = packet['fromId']
+
                 with self.node_list_lock:
                     info = next((info for nid, info in self.node_list if nid == fromnum), {})
-                shortname = info.get("longName", "Unknown")
-                hops = info.get("hopsAway", "?")
-                to_id = packet.get("toId") or decoded.get("to")
-                prefix = "C]" if to_id is None or to_id == "^all" else "D]" if to_id == self.my_node_id else "UNK]"
+
+                long_name = info.get('longName', f"Meshtastic {fromnum[-4:]}")
+                hops = info.get('hopsAway', '?')
+                snr = info.get('snr', None)
+                role = info.get('role', 'none')
+                channel_utilization = info.get("channelUtilization", None)
+
+
+                to_id = packet.get('toId') or decoded_packet.get('to')
+                if to_id is None or to_id == '^all':
+                    prefix = "C]"
+                elif to_id == self.my_node_id:
+                    prefix = "D]"
+                else:
+                    prefix = "UNK]"
+
                 if prefix in ("C]", "D]"):
+                    formatted_text = (
+                        # fromnum is the device ID name where shortname is derived
+                        f"Received From: {long_name} - {fromnum}\n"
+                        "```\n"
+                        f"{message}\n"
+                        "```\n Stats: \n"
+                        f"`hops = {hops}`\n"
+                        f"`snr  = {snr}`\n"
+                       # f"`role = {role}`"
+                        f"`channel busy % = {channel_utilization}`"
+                    )
+
+
+
                     asyncio.run_coroutine_threadsafe(
-                        send_to_discord(f"H{hops} {prefix} {shortname}: {message}"),
+                        send_to_discord(formatted_text),
                         bot.loop
                     )
-        except Exception as e:
-            print(f"[mesh] on_receive exception: {e}")
+        except (KeyError, UnicodeDecodeError):
+            pass
+
+
+
 
 
     def stop(self):
@@ -392,16 +442,36 @@ class MeshSession:
 
 
 
+def get_cache_cursor():
+    conn = sqlite3.connect(NODE_CACHE_DB)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    return conn, cursor
 
-# helper: convert lat/lon to flat km offsets
+
+
 def latlon_to_km(lat, lon, center_lat, center_lon):
-    if lat is None or lon is None:
+    try:
+        if lat is None or lon is None or center_lat is None or center_lon is None:
+            return None, None
+        
+        lat = float(lat)
+        lon = float(lon)
+        center_lat = float(center_lat)
+        center_lon = float(center_lon)
+
+        earth_radius_km = 6371.0
+
+        lat_rad = math.radians(lat)
+        lon_rad = math.radians(lon)
+        center_lat_rad = math.radians(center_lat)
+        center_lon_rad = math.radians(center_lon)
+
+        x = earth_radius_km * (lon_rad - center_lon_rad) * math.cos((lat_rad + center_lat_rad) / 2)
+        y = earth_radius_km * (lat_rad - center_lat_rad)
+        return x, y
+    except (ValueError, TypeError):
         return None, None
-    delta_lat = lat - center_lat
-    delta_lon = lon - center_lon
-    y = delta_lat * 111
-    x = delta_lon * 111 * math.cos(math.radians(center_lat))
-    return x, y
 
 
 async def generate_hopmap_png(max_hops: int, filename: str):
@@ -411,54 +481,175 @@ async def generate_hopmap_png(max_hops: int, filename: str):
     nodes = {}
     async with aiosqlite.connect(NODE_CACHE_DB) as db:
         async with db.execute(
-            "SELECT id, latitude, longitude, hopsAway FROM nodes WHERE hopsAway <= ?", 
+            "SELECT id, latitude, longitude, hopsAway FROM nodes WHERE hopsAway BETWEEN 0 AND ?",
             (max_hops,)
         ) as cursor:
             async for row in cursor:
                 nid, lat, lon, hops = row
+                #print('NodeID: ', nid)
+
+                try:
+                    lat = float(lat)
+                except (ValueError, TypeError):
+                    lat = None
+
+                try:
+                    lon = float(lon)
+                except (ValueError, TypeError):
+                    lon = None
+
+                try:
+                    hops = int(hops)
+                except (ValueError, TypeError):
+                    hops = None
+                
+                print(nid)
+
+                if nid == MY_ID:
+                    #print('found my node and fixing the hop count')
+                    hops = 0
+                    if lat is None or lon is None:
+                        lat = CENTER_LAT
+                        lon = CENTER_LON
+                        
                 if hops not in nodes:
                     nodes[hops] = []
-                nodes[hops].append({"_id": nid, "position": {"latitude": lat, "longitude": lon}})
 
-    randomgrouping = 1 + (max_hops * 3)
-    randomvalidgrouping = 1
+                nodes[hops].append({
+                    "_id": nid,
+                    "position": {"latitude": lat, "longitude": lon},
+                    "hopsAway": hops
+                })
 
     plt.figure(figsize=(8, 8))
-    for hop_count, node_list in nodes.items():
+    gps_positions_by_hop = {i: [] for i in range(max_hops + 1)}
+    
+    for hop_count in sorted(nodes.keys()):
+        node_list = nodes[hop_count]
         valid_positions = []
+        outliers = []
+
         for n in node_list:
-            pos = n.get("position") or {}
-            lat = pos.get("latitude")
-            lon = pos.get("longitude")
-            x, y = latlon_to_km(lat, lon, center_lat, center_lon)
-            if x is not None and y is not None and math.sqrt(x ** 2 + y ** 2) <= 200:
+            lat = n["position"]["latitude"]
+            lon = n["position"]["longitude"]
+
+            if lat is None or lon is None:
+                n["xy"] = None
+                continue  # skip invalid coordinates
+
+            x, y = latlon_to_km(lat, lon, CENTER_LAT, CENTER_LON)
+
+            if x is None or y is None:
+                n["xy"] = None
+                continue  # skip failed conversion
+
+            n["xy"] = (x, y)
+            distance = math.hypot(x, y)
+
+            if distance <= MAX_DISTANCE_KM:
                 valid_positions.append((x, y))
-
-        for n in node_list:
-            pos = n.get("position") or {}
-            lat = pos.get("latitude")
-            lon = pos.get("longitude")
-            node_id = n.get("_id", "unknown")
-
-            x, y = latlon_to_km(lat, lon, center_lat, center_lon)
-            if x is not None and y is not None and math.sqrt(x ** 2 + y ** 2) <= 200:
-                plt.scatter(x, y, color="green", s=50)
-                plt.annotate(node_id, (x, y), xytext=(5, 5), textcoords="offset points",
-                             fontsize=8, color="green")
             else:
+                outliers.append((x, y))
+
+        # Only store the valid positions in gps_positions_by_hop
+        gps_positions_by_hop[hop_count] = valid_positions
+
+
+
+
+    
+    gps_positions = [pos for sublist in gps_positions_by_hop.values() for pos in sublist]
+    
+    # --- Scaling Logic ---
+    if gps_positions:
+        xs, ys = zip(*gps_positions)
+        max_dist = max(max(abs(x) for x in xs), max(abs(y) for y in ys)) if xs and ys else 0
+
+        MIN_MAP_RANGE_HALF = 10  # 10km from center
+
+        # For hop‑0, force your node to (0,0) and center the map
+        if max_hops == 0:
+            # Override gps_positions to contain only your node at 0,0
+            gps_positions = [(0.0, 0.0)]
+            max_plot_range = MIN_MAP_RANGE_HALF
+            plt.xlim(-max_plot_range, max_plot_range)
+            plt.ylim(-max_plot_range, max_plot_range)
+        else:
+            # Determine final map range based on max distance or a minimum
+            if max_dist < MIN_MAP_RANGE_HALF:
+                max_plot_range = MIN_MAP_RANGE_HALF
+            else:
+                max_plot_range = max_dist * 1.40
+
+            plt.xlim(-max_plot_range, max_plot_range)
+            plt.ylim(-max_plot_range, max_plot_range)
+    else:
+        max_plot_range = 20 * max_hops
+        plt.xlim(-max_plot_range, max_plot_range)
+        plt.ylim(-max_plot_range, max_plot_range)
+
+    scatter_radius = (plt.xlim()[1] - plt.xlim()[0]) * 0.05
+    
+
+    for hop_count in sorted(nodes.keys()):
+        node_list = nodes[hop_count]
+        valid_positions = []
+        outliers = []
+
+        # classify nodes as valid or outlier
+        for n in node_list:
+            lat = n["position"]["latitude"]
+            lon = n["position"]["longitude"]
+
+            if lat is None or lon is None:
+                n["xy"] = None
+                continue
+
+            x, y = latlon_to_km(lat, lon, CENTER_LAT, CENTER_LON)
+            n["xy"] = (x, y)
+
+            if x is None or y is None:
+                continue
+
+            distance = math.hypot(x, y)
+            if distance <= MAX_DISTANCE_KM:
+                valid_positions.append((x, y))
+            else:
+                outliers.append((x, y))
+
+        gps_positions_by_hop[hop_count] = valid_positions
+
+        # Plot nodes
+        for n in node_list:
+            node_id = n["_id"]
+
+            if n["xy"] is not None and n["xy"] in valid_positions:
+                x, y = n["xy"]
+                color = "green"
+            elif n["xy"] is not None and n["xy"] in outliers:
+                # Place outliers near the edge
+                x, y = n["xy"]
+                distance = math.hypot(x, y)
+                scale = OUTLIER_MARGIN * max_plot_range / distance
+                x *= scale
+                y *= scale
+                color = "red"
+            else:
+                # Fallback: scatter around other valid nodes
                 if valid_positions:
                     base_x, base_y = random.choice(valid_positions)
-                    x = base_x + random.uniform(-randomvalidgrouping, randomvalidgrouping)
-                    y = base_y + random.uniform(-randomvalidgrouping, randomvalidgrouping)
+                    x = base_x + random.uniform(-scatter_radius, scatter_radius)
+                    y = base_y + random.uniform(-scatter_radius, scatter_radius)
                 else:
-                    x = random.uniform(-randomgrouping, randomgrouping)
-                    y = random.uniform(-randomgrouping, randomgrouping)
-                plt.scatter(x, y, color="red", s=50)
-                plt.annotate(node_id, (x, y), xytext=(5, 5), textcoords="offset points",
-                             fontsize=8, color="red")
+                    x = y = 0
+                color = "red"
 
-    plt.xlim(-50, 50)
-    plt.ylim(-50, 50)
+            plt.scatter(x, y, color=color, s=50)
+            plt.annotate(node_id, (x, y), xytext=(5, 5), textcoords="offset points",
+                        fontsize=8, color=color)
+
+
+
     plt.xlabel("East (km)")
     plt.ylabel("North (km)")
     total_nodes = sum(len(lst) for lst in nodes.values())
@@ -467,18 +658,12 @@ async def generate_hopmap_png(max_hops: int, filename: str):
     plt.axis("equal")
     plt.tight_layout()
 
-    # save local PNG for debugging
     plt.savefig(filename, dpi=300, bbox_inches="tight")
-
-    # return the in memory copy for discord to post to channel
     buf = io.BytesIO()
     plt.savefig(buf, format="png", dpi=300, bbox_inches="tight")
     buf.seek(0)
     plt.close()
     return buf
-
-
-
 
 
 
@@ -488,6 +673,95 @@ async def send_to_discord(text):
         await channel.send(text)
     else:
         print(f"[warn] No channel named #{INCOMING_CHANNEL_NAME} found")
+
+
+
+
+
+
+
+def generate_channel_utilization_graph(node_id, hwaddr):
+    conn = None
+    try:
+        conn = sqlite3.connect(HISTORY_DB_FILE)
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT timestamp, channelUtilization FROM node_history WHERE macaddr = ? ORDER BY timestamp ASC", (hwaddr,))
+        rows = cursor.fetchall()
+        
+        if not rows:
+            return None, "No historical data found for this node."
+
+        seen_entries = set()
+        unique_data = []
+        for row in rows:
+            entry_tuple = tuple(row[1:])
+            if entry_tuple not in seen_entries:
+                seen_entries.add(entry_tuple)
+                unique_data.append(row)
+        
+        timestamps = [datetime.fromisoformat(row[0]) for row in unique_data]
+        utilizations = [row[1] for row in unique_data]
+        
+        if not timestamps:
+            return None, "No unique data points to graph."
+
+        plt.figure(figsize=(10.24, 7.68), dpi=300)
+        plt.plot(timestamps, utilizations, marker='o', linestyle='-')
+        
+        plt.title(f"Channel Utilization for Node {node_id} ({hwaddr})")
+        plt.xlabel("Timestamp (UTC)")
+        plt.ylabel("Channel Utilization")
+        plt.ylim(0.0, 100.0)
+        plt.grid(True)
+        plt.xticks(rotation=45, ha='right')
+        plt.tight_layout()
+        
+        filename = f"{node_id}_channel_utilization_graph.png"
+        plt.savefig(filename)
+        plt.close()
+
+        return filename, None
+
+    except sqlite3.Error as e:
+        return None, f"Database error: {e}"
+    except Exception as e:
+        return None, f"An unexpected error occurred: {e}"
+    finally:
+        if conn:
+            conn.close()
+
+
+
+
+
+async def nodesearch_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    conn = None
+    try:
+        conn, cursor = get_cache_cursor()
+        # Find node IDs and longNames that start with the current input
+        query = "SELECT DISTINCT id FROM nodes WHERE id LIKE ? LIMIT 25"
+        cursor.execute(query, (f'{current}%',))
+        
+        results = cursor.fetchall()
+        
+        choices = []
+        for row in results:
+            choices.append(app_commands.Choice(name=row[0], value=row[0]))
+        
+        return choices
+
+    except Exception:
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+
+
+
+
+
 
 
 async def register_commands():
@@ -526,7 +800,7 @@ async def register_commands():
 
 
 
-    @bot.tree.command(name="nodes_local", description="Show cached local node info", guild=guild_obj)
+    @bot.tree.command(name="nodes_local", description="Show cached local nodedb", guild=guild_obj)
     async def nodes_local(interaction: discord.Interaction, limit: int = 3):
         # get the dedicated output channel
         output_channel = discord.utils.get(interaction.guild.text_channels, name="nodes-info")
@@ -539,8 +813,8 @@ async def register_commands():
 
         conn = None
         try:
-            conn = sqlite3.connect(NODE_CACHE_DB)
-            cursor = conn.cursor()
+            conn, cursor = get_cache_cursor()
+
             cursor.execute("""
                 SELECT id, longName, hopsAway, snr, airUtilTx, role, lastHeard, firstSeen
                 FROM nodes
@@ -594,6 +868,8 @@ async def register_commands():
 
 
 
+
+
     @bot.tree.command(name="nodedata", description="Show data from recently heard nodes", guild=guild_obj)
     @app_commands.choices(
         key=[
@@ -630,8 +906,9 @@ async def register_commands():
 
         conn = None
         try:
-            conn = sqlite3.connect(NODE_CACHE_DB)
-            cursor = conn.cursor()
+            conn, cursor = get_cache_cursor()
+
+
 
             # get node data from cache db
             cursor.execute(f"""
@@ -726,6 +1003,87 @@ async def register_commands():
 
 
 
+
+
+
+    @bot.tree.command(name="nodesearch", description="Search for a specific node by ID or name and print channel busy %", guild=guild_obj)
+    @app_commands.autocomplete(node_id=nodesearch_autocomplete)
+    async def nodesearch(interaction: discord.Interaction, node_id: str):
+        output_channel = discord.utils.get(interaction.guild.text_channels, name="nodes-info")
+        if output_channel is None:
+            await interaction.response.send_message("Output channel #nodes-info not found.", ephemeral=True)
+            return
+        
+        await interaction.response.send_message(
+            f"Processing search for node ID: {node_id}, output will go to #nodes-info",
+            ephemeral=True
+        )
+
+        conn = None
+        try:
+            conn, cursor = get_cache_cursor()
+            
+            cursor.execute("""
+                SELECT macaddr, id, longName, hopsAway, snr, airUtilTx, role, lastHeard, firstSeen
+                FROM nodes
+                WHERE id = ? OR longName LIKE ?
+                LIMIT 1
+            """, (node_id, f'%{node_id}%'))
+            
+            node_data = cursor.fetchone()
+            
+            if not node_data:
+                await output_channel.send(f"Node '{node_id}' not found.")
+                return
+
+            macaddr, nid, longName, hops, snr, airtime, role, lastHeard_ts, firstSeen_iso = node_data
+            last_heard_dt = datetime.fromtimestamp(lastHeard_ts)
+            first_seen_dt = datetime.fromisoformat(firstSeen_iso)
+            
+            hours_ago = int((datetime.utcnow() - last_heard_dt).total_seconds() // 3600)
+            first_hours_ago = int((datetime.utcnow() - first_seen_dt).total_seconds() // 3600)
+
+            fmt = lambda v: f"{v:.2f}" if v is not None else "0.00"
+            
+            message = (
+                f"**Node Details for '{nid}' ({longName or 'Unknown'})**\n"
+                f"MAC: `{macaddr}`\n"
+                f"Hops: `{hops}`\n"
+                f"SNR: `{fmt(snr)}`\n"
+                f"AirTime: `{fmt(airtime)}`\n"
+                f"Role: `{role or 'unknown'}`\n"
+                f"Last Seen: `{last_heard_dt.strftime('%Y-%m-%d %H:%M:%S UTC')} ({hours_ago} hours ago)`\n"
+                f"First Seen: `{first_seen_dt.strftime('%Y-%m-%d %H:%M:%S UTC')} ({first_hours_ago} hours ago)`"
+            )
+            
+            await output_channel.send(message)
+            # graph generation function and send the file
+            filename, error_message = generate_channel_utilization_graph(nid, macaddr)
+            if filename:
+                try:
+                    graph_file = discord.File(filename)
+                    await output_channel.send(file=graph_file)
+                finally:
+                    os.remove(filename)
+            else:
+                await output_channel.send(f"Could not generate graph: {error_message}")
+            
+
+
+        except sqlite3.Error as e:
+            await output_channel.send(f"Failed to query database: {e}")
+        except Exception as e:
+            await output_channel.send(f"An unexpected error occurred: {e}")
+        finally:
+            if conn:
+                conn.close()
+
+
+
+
+
+
+
     @bot.tree.command(name="newnodes", description="Show only new nodes seen in the last N hours", guild=guild_obj)
     async def newnodes(interaction: discord.Interaction, hours: int):
         # deduplicate results by hw addr 
@@ -751,8 +1109,8 @@ async def register_commands():
             cutoff_dt = datetime.utcnow() - timedelta(hours=hours)
             cutoff_ts = int(cutoff_dt.timestamp())
 
-            conn = sqlite3.connect(NODE_CACHE_DB)
-            cursor = conn.cursor()
+            conn, cursor = get_cache_cursor()
+
 
             # sort by firstSeen ascending-order
             cursor.execute("""
@@ -799,8 +1157,8 @@ async def register_commands():
                 lines.append(
                     f"{nid} ({longName or 'Unknown'}) [MAC: {macaddr}] - hops: {hops}, "
                     f"SNR: {fmt(snr)}, AirTime: {fmt(airtime)}, role: {role or 'unknown'}\n"
-                    f"  Last Seen: {last_heard_dt.strftime('%Y-%m-%d %H:%M:%S UTC')} ({hours_ago} hours ago)\n"
-                    f"  First Seen: {first_seen_dt.strftime('%Y-%m-%d %H:%M:%S UTC')} ({first_hours_ago} hours ago)"
+                    f"`  Last Seen: {last_heard_dt.strftime('%Y-%m-%d %H:%M:%S UTC')} ({hours_ago} hours ago)` \n"
+                    f"`  First Seen: {first_seen_dt.strftime('%Y-%m-%d %H:%M:%S UTC')} ({first_hours_ago} hours ago)` \n"
                 )
 
             # send discord-safe chunks
@@ -825,6 +1183,17 @@ async def register_commands():
 
 
 
+@bot.event
+async def on_message(message):
+    if message.author == bot.user:
+        return
+
+    if isinstance(message.channel, discord.DMChannel):
+        # message was sent to the bot in a DM
+        print(f"Received DM from {message.author.name}: {message.content}")
+        await message.channel.send("Hello! I received your message in a DM.")
+    
+    await bot.process_commands(message)
 
 @bot.event
 async def on_ready():
