@@ -938,23 +938,27 @@ async def register_commands():
         timeout_ms = 150
         successful_pings = []
 
-        for i in range(count):
-            try:
-                proc = await asyncio.wait_for(
-                    asyncio.create_subprocess_exec(
-                        "ping", "-c", "1", "-W", str(timeout_ms // 1000), host,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE
-                    ),
-                    timeout=(timeout_ms / 1000) + 0.01
-                )
-                stdout, _ = await proc.communicate()
-                output = stdout.decode()
-                match = re.search(r"time[=<]([0-9\.]+)", output)
-                if match:
-                    successful_pings.append(float(match.group(1)))
-            except asyncio.TimeoutError:
-                pass
+        try:
+            for i in range(count):
+                try:
+                    proc = await asyncio.wait_for(
+                        asyncio.create_subprocess_exec(
+                            "ping", "-c", "1", "-W", str(timeout_ms // 1000), host,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE
+                        ),
+                        timeout=(timeout_ms / 1000) + 0.01
+                    )
+                    stdout, _ = await proc.communicate()
+                    output = stdout.decode()
+                    match = re.search(r"time[=<]([0-9\.]+)", output)
+                    if match:
+                        successful_pings.append(float(match.group(1)))
+                except asyncio.TimeoutError:
+                    pass
+        except FileNotFoundError:
+            await interaction.followup.send("Bot online : Ping command not found on system")
+            return
 
         if successful_pings:
             avg_ping = sum(successful_pings) / len(successful_pings)
@@ -963,6 +967,7 @@ async def register_commands():
             msg = "Bot online : Heltec offline (no response)"
 
         await interaction.followup.send(msg)
+
 
 
 
