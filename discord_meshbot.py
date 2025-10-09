@@ -928,7 +928,11 @@ async def register_commands():
 
     @bot.tree.command(name="status", description="check bot and Heltec node status", guild=guild_obj)
     async def status(interaction: discord.Interaction):
-        await interaction.response.defer()  # times out without this i guess
+        await interaction.response.defer()
+
+        if host.lower() == "serial":
+            await interaction.followup.send("Bot online : Heltec connected via serial (ping skipped)")
+            return
 
         count = 3
         timeout_ms = 150
@@ -946,13 +950,11 @@ async def register_commands():
                 )
                 stdout, _ = await proc.communicate()
                 output = stdout.decode()
-
-                # time=XXX ms
                 match = re.search(r"time[=<]([0-9\.]+)", output)
                 if match:
                     successful_pings.append(float(match.group(1)))
             except asyncio.TimeoutError:
-                pass  # failed ping
+                pass
 
         if successful_pings:
             avg_ping = sum(successful_pings) / len(successful_pings)
@@ -961,6 +963,7 @@ async def register_commands():
             msg = "Bot online : Heltec offline (no response)"
 
         await interaction.followup.send(msg)
+
 
 
     @bot.tree.command(
