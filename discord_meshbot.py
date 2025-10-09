@@ -2,10 +2,14 @@ import os, io, time, json, threading, asyncio, re, random, math
 from datetime import datetime, timedelta
 
 import discord
-from discord.ext import commands, tasks
-from meshtastic.tcp_interface import TCPInterface
-from pubsub import pub  # pip install pypubsub
+from discord.ext import commands
+from discord import Interaction
 from discord import app_commands
+
+from meshtastic.tcp_interface import TCPInterface
+from meshtastic.serial_interface import SerialInterface
+from pubsub import pub  # pip install pypubsub
+
 import matplotlib
 matplotlib.use("Agg")  # Must come before importing pyplot
 import matplotlib.pyplot as plt
@@ -15,41 +19,37 @@ import math
 import matplotlib.pyplot as plt
 import os
 import random
-
-import contextily as ctx
-import geopandas as gpd
-from shapely.geometry import Point
 import sqlite3, aiosqlite
 from dotenv import load_dotenv
-
-
 
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 CENTER_LAT = os.getenv("CENTER_LAT")
 CENTER_LON = os.getenv("CENTER_LON")
-
-
-
+host = os.getenv("MESHNODE_IP")
+NODE_CACHE_DB = os.getenv("NODE_CACHE_DB")
+HISTORY_DB_FILE = os.getenv("HISTORY_DB_FILE")
+meshportnum = os.getenv("MESHPORTNUM")
+INCOMING_CHANNEL_NAME = os.getenv("INCOMING_CHANNEL_NAME")
+MY_ID = os.getenv("MY_NODE_ID") # count num of hops for map from this node as center of map
+permsinteger = os.getenv("DISCORD_BOT_PERMS")
 
 # ====== CONFIG ======
-host = '192.168.1.6'
-NODE_CACHE_DB = "sqlite_cache.db"       # contains only current node list no duplicates
-HISTORY_DB_FILE = "nodes_history.db"    # full history log will become large
-INCOMING_CHANNEL_NAME = "mesh-incoming"   # channel name of where to post the messages
 NODE_REFRESH_INTERVAL = 900             # num of seconds to refresh nodedb from device
-permsinteger = "274877941760"           # discord bot pernissions for channel access
-MAX_DISTANCE_KM = 500
-OUTLIER_MARGIN = 0.85
-MY_ID = "!849a06e8"
-# ====================
+MAX_DISTANCE_KM = 500 # ignore client gps info if its bigger than this value
+OUTLIER_MARGIN = 0.85 # variance tolerance on mapping
+CLEANUP_INTERVAL = 14400  # node_history deduplication every 4hrs
+
+AUTHORIZED_SEND_USERS = [
+    int(x.strip()) for x in os.getenv("AUTHORIZED_SEND_USERS", "").split(",") if x.strip()
+]
+
 
 
 intents = discord.Intents.default()
 intents.guilds = True
 bot = commands.Bot(command_prefix="!", intents=intents)
-
 MESH_SESSION = None
 GUILD_ID = None
 
@@ -70,8 +70,10 @@ class MeshSession:
 
     def _background_loop(self):
         last_refresh = 0
+        last_cleanup = 0
         cache_conn, cache_cursor = None, None
         history_conn, history_cursor = None, None
+        
 
         # key values were valid for 2.6.11 , might change in the future
         COMMON_COLUMNS = """
@@ -136,11 +138,16 @@ class MeshSession:
 
                 # only pull from mesh device if x amount of time has passed
                 now_ts = time.time()
+
                 if self.online and (now_ts - last_refresh >= NODE_REFRESH_INTERVAL):
                     self.fetch_nodes(cache_conn, cache_cursor, history_conn, history_cursor)
                     last_refresh = now_ts
 
-                time.sleep(1)
+                if now_ts - last_cleanup >= CLEANUP_INTERVAL:
+                    threading.Thread(target=cleanup_history_db, args=(HISTORY_DB_FILE,), daemon=True).start()
+                    last_cleanup = now_ts
+
+                time.sleep(1) # small delay for thread to establish
 
             except sqlite3.Error as e:
                 print(f"[mesh] Database error: {e}")
@@ -205,17 +212,41 @@ class MeshSession:
             except Exception:
                 pass
             self.interface = None
+            self.online = False
 
+
+        # serial connect path
+        if self.node_ip.lower() == "serial":
+            print("[mesh] Connecting via serial interface...")
+            try:
+                self.interface = SerialInterface()
+                pub.subscribe(self.on_receive, "meshtastic.receive")
+                self.online = True
+                print("[mesh] Serial connection established")
+            except Exception as e:
+                self.interface = None
+                self.online = False
+                print(f"[mesh] Failed to connect via serial: {e}")
+            return
+
+        # tcp/ip path
+        print(f"[mesh] Connecting to {self.node_ip} via TCP...")
         try:
-            print(f"[mesh] Connecting to {self.node_ip}...")
-            self.interface = TCPInterface(hostname=self.node_ip)
+            self.interface = TCPInterface(hostname=self.node_ip, portNumber="4404")
             pub.subscribe(self.on_receive, "meshtastic.receive")
             self.online = True
-            print("[mesh] Connected to host")
+            print("[mesh] TCP connection established")
         except Exception as e:
             self.interface = None
             self.online = False
-            print(f"[mesh] Failed to connect: {e}")
+            print(f"[mesh] Failed to connect via TCP: {e}")
+
+
+
+
+
+
+
 
 
     def fetch_nodes(self, cache_conn, cache_cursor, history_conn, history_cursor):
@@ -383,7 +414,7 @@ class MeshSession:
             decoded_packet = packet.get('decoded', {})
             if decoded_packet.get('portnum') == 'TEXT_MESSAGE_APP':
                 message = decoded_packet['payload'].decode('utf-8', errors='ignore')
-                fromnum = packet['fromId']
+                fromnum = packet.get('fromId', 'unknown')
 
                 with self.node_list_lock:
                     info = next((info for nid, info in self.node_list if nid == fromnum), {})
@@ -430,8 +461,7 @@ class MeshSession:
 
 
     def stop(self):
-        """Stop the background loop and clean up interface."""
-        self._stop_event.set()
+        self._stop_event.set()  # signal loops to stop
         if self.interface:
             try:
                 self.interface.close()
@@ -440,6 +470,42 @@ class MeshSession:
         self.online = False
 
 
+def cleanup_history_db(db_path):
+    table_name = "node_history"
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute(f"SELECT COUNT(*) FROM {table_name}")
+    before_count = cur.fetchone()[0]
+
+    cur.execute(f"PRAGMA table_info({table_name})")
+    cols = [row[1] for row in cur.fetchall()]
+
+    # exclude the timestamp column
+    cols_no_ts = [c for c in cols if c != "timestamp"]
+    cols_str = ", ".join(cols_no_ts)
+
+    # drop any rows (excluding timestamp) which are the same value
+    # removes duplicate entries
+    cur.execute(f"""
+        DELETE FROM {table_name}
+        WHERE rowid NOT IN (
+            SELECT MIN(rowid)
+            FROM {table_name}
+            GROUP BY {cols_str}
+        )
+    """)
+
+    # get final row count for log message
+    cur.execute(f"SELECT COUNT(*) FROM {table_name}")
+    after_count = cur.fetchone()[0]
+    
+    # save the output, 
+    conn.commit()
+    cur.execute("VACUUM")
+    conn.close()
+
+    removed = before_count - after_count
+    print(f"Before: {before_count}, After: {after_count}, Removed: {removed}")
 
 
 def get_cache_cursor():
@@ -447,7 +513,6 @@ def get_cache_cursor():
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     return conn, cursor
-
 
 
 def latlon_to_km(lat, lon, center_lat, center_lon):
@@ -666,7 +731,6 @@ async def generate_hopmap_png(max_hops: int, filename: str):
     return buf
 
 
-
 async def send_to_discord(text):
     channel = discord.utils.get(bot.get_all_channels(), name=INCOMING_CHANNEL_NAME)
     if channel:
@@ -675,20 +739,27 @@ async def send_to_discord(text):
         print(f"[warn] No channel named #{INCOMING_CHANNEL_NAME} found")
 
 
-
-
-
-
-
-def generate_channel_utilization_graph(node_id, hwaddr):
+def generate_nodedata_graph(node_id, hwaddr, key):
     conn = None
     try:
         conn = sqlite3.connect(HISTORY_DB_FILE)
         cursor = conn.cursor()
-        
-        cursor.execute("SELECT timestamp, channelUtilization FROM node_history WHERE macaddr = ? ORDER BY timestamp ASC", (hwaddr,))
+
+        valid_keys = {
+            "batteryLevel": ("Battery Level", "Battery Level (%)", (0.0, 100.0)),
+            "airUtilTx": ("Air Utilization TX", "Air Utilization TX (%)", (0.0, 100.0)),
+            "channelUtilization": ("Channel Utilization", "Channel Utilization (%)", (0.0, 100.0)),
+            "uptimeSeconds": ("Uptime Seconds", "Uptime (s)", None)
+        }
+
+        if key not in valid_keys:
+            return None, f"Invalid key: {key}"
+
+        title, ylabel, ylim = valid_keys[key]
+        query = f"SELECT timestamp, {key} FROM node_history WHERE macaddr = ? ORDER BY timestamp ASC"
+        cursor.execute(query, (hwaddr,))
         rows = cursor.fetchall()
-        
+
         if not rows:
             return None, "No historical data found for this node."
 
@@ -699,25 +770,26 @@ def generate_channel_utilization_graph(node_id, hwaddr):
             if entry_tuple not in seen_entries:
                 seen_entries.add(entry_tuple)
                 unique_data.append(row)
-        
+
         timestamps = [datetime.fromisoformat(row[0]) for row in unique_data]
-        utilizations = [row[1] for row in unique_data]
-        
+        values = [row[1] for row in unique_data]
+
         if not timestamps:
             return None, "No unique data points to graph."
 
         plt.figure(figsize=(10.24, 7.68), dpi=300)
-        plt.plot(timestamps, utilizations, marker='o', linestyle='-')
-        
-        plt.title(f"Channel Utilization for Node {node_id} ({hwaddr})")
+        plt.plot(timestamps, values, marker='o', linestyle='-')
+
+        plt.title(f"{title} for Node {node_id} ({hwaddr})")
         plt.xlabel("Timestamp (UTC)")
-        plt.ylabel("Channel Utilization")
-        plt.ylim(0.0, 100.0)
+        plt.ylabel(ylabel)
+        if ylim:
+            plt.ylim(*ylim)
         plt.grid(True)
         plt.xticks(rotation=45, ha='right')
         plt.tight_layout()
-        
-        filename = f"{node_id}_channel_utilization_graph.png"
+
+        filename = f"{node_id}_{key}_graph.png"
         plt.savefig(filename)
         plt.close()
 
@@ -730,9 +802,6 @@ def generate_channel_utilization_graph(node_id, hwaddr):
     finally:
         if conn:
             conn.close()
-
-
-
 
 
 async def nodesearch_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
@@ -756,12 +825,6 @@ async def nodesearch_autocomplete(interaction: discord.Interaction, current: str
     finally:
         if conn:
             conn.close()
-
-
-
-
-
-
 
 
 async def register_commands():
@@ -796,12 +859,8 @@ async def register_commands():
             await interaction.followup.send(f"Failed to generate hopmap: {e}", ephemeral=True)
 
 
-
-
-
-
     @bot.tree.command(name="nodes_local", description="Show cached local nodedb", guild=guild_obj)
-    async def nodes_local(interaction: discord.Interaction, limit: int = 3):
+    async def nodes_local(interaction: discord.Interaction, hopcountlimit: int = 3):
         # get the dedicated output channel
         output_channel = discord.utils.get(interaction.guild.text_channels, name="nodes-info")
         if output_channel is None:
@@ -820,12 +879,12 @@ async def register_commands():
                 FROM nodes
                 WHERE hopsAway <= ?
                 ORDER BY hopsAway ASC
-            """, (limit,))
+            """, (hopcountlimit,))
             
             nodes_raw = cursor.fetchall()
 
             if not nodes_raw:
-                await output_channel.send(f"No nodes with hops ≤ {limit} in the database.")
+                await output_channel.send(f"No nodes with hops ≤ {hopcountlimit} in the database.")
                 return
 
             # timestamp of the most recent node update
@@ -866,105 +925,6 @@ async def register_commands():
                 conn.close()
 
 
-
-
-
-
-    @bot.tree.command(name="nodedata", description="Show data from recently heard nodes", guild=guild_obj)
-    @app_commands.choices(
-        key=[
-            app_commands.Choice(name="Battery Level", value="batteryLevel"),
-            app_commands.Choice(name="Air Utilization TX", value="airUtilTx"),
-            app_commands.Choice(name="Channel Utilization", value="channelUtilization"),
-            app_commands.Choice(name="Uptime Seconds", value="uptimeSeconds"),
-        ]
-    )
-    async def nodedata(
-        interaction: discord.Interaction,
-        key: app_commands.Choice[str],
-        hop_limit: int = 3,
-        hours: int = 2
-    ):
-        output_channel = discord.utils.get(interaction.guild.text_channels, name="nodes-info")
-        if output_channel is None:
-            await interaction.response.send_message("Output channel #nodes-info not found.", ephemeral=True)
-            return
-
-        await interaction.response.send_message(
-            f"Processing nodes for the last {hours} hours, output will go to #nodes-info",
-            ephemeral=True
-        )
-
-        if key.value not in {"batteryLevel", "airUtilTx", "channelUtilization", "uptimeSeconds"}:
-            await output_channel.send(
-                f"Invalid key '{key.value}', must be one of batteryLevel, airUtilTx, channelUtilization, uptimeSeconds."
-            )
-            return
-
-
-        cutoff_ts = int((datetime.utcnow() - timedelta(hours=hours)).timestamp())
-
-        conn = None
-        try:
-            conn, cursor = get_cache_cursor()
-
-
-
-            # get node data from cache db
-            cursor.execute(f"""
-                SELECT id, longName, hopsAway, {key.value}
-                FROM nodes
-                WHERE lastHeard >= ? AND hopsAway <= ?
-                ORDER BY {key.value} DESC
-            """, (cutoff_ts, hop_limit))
-
-            rows = cursor.fetchall()
-
-            if not rows:
-                await output_channel.send(
-                    f"No nodes seen in the last {hours} hours within hop limit {hop_limit}."
-                )
-                return
-
-
-            # group 1st pass of sorting by hop count
-            hop_groups = {}
-            for nid, longName, hops, value in rows:
-                if hops not in hop_groups:
-                    hop_groups[hops] = []
-                hop_groups[hops].append((nid, longName, value))
-
-            lines = [f"Nodes sorted by {key.value} (last {hours} hours, hop limit {hop_limit}):\n"]
-
-            for hop in sorted(hop_groups.keys()):
-                lines.append(f"Hop-{hop}:")
-                # after sorting by hopcount, sort inner results by low-to-hgh
-                group = sorted(
-                    hop_groups[hop],
-                    key=lambda x: (x[2] is None, x[2] if x[2] is not None else float("inf"))
-                )
-                for nid, longName, value in group:
-                    val_str = f"{value:.2f}" if value is not None else "0.00"
-                    lines.append(f"{nid} ({longName or 'Unknown'}) - {val_str}")
-                lines.append("")  # blank line between hop groups
-
-            chunk = ""
-            for line in lines:
-                if len(chunk) + len(line) + 1 > 2000:
-                    await output_channel.send(chunk)
-                    chunk = line + "\n"
-                else:
-                    chunk += line + "\n"
-            if chunk:
-                await output_channel.send(chunk)
-
-        except sqlite3.Error as e:
-            await output_channel.send(f"Failed to query database: {e}")
-        finally:
-            if conn:
-                conn.close()
-    
-
     @bot.tree.command(name="status", description="check bot and Heltec node status", guild=guild_obj)
     async def status(interaction: discord.Interaction):
         await interaction.response.defer()  # times out without this i guess
@@ -1002,36 +962,83 @@ async def register_commands():
         await interaction.followup.send(msg)
 
 
+    @bot.tree.command(
+        name="send",
+        description="Send a general message over the mesh network",
+        guild=guild_obj
+    )
+    @app_commands.describe(message="The text to send over the mesh")
+    async def send(interaction: Interaction, message: str):
+        if interaction.user.id not in AUTHORIZED_SEND_USERS:
+            print(f"[error] User {interaction.user.id} failed to send message")
+            await interaction.response.send_message(
+                "You are not authorized to use this command", ephemeral=True
+            )
+            return
+
+        try:
+            if MESH_SESSION.interface:
+                MESH_SESSION.interface.sendText(message)
+                await interaction.response.send_message(f"[mesh] Sent: {message}", ephemeral=True)
+
+                formatted_text = (
+                    f"Sent From: Discord - {interaction.user.display_name}\n"
+                    "```\n"
+                    f"{message}\n"
+                    "```\n"
+                )
 
 
+                asyncio.run_coroutine_threadsafe(
+                    send_to_discord(formatted_text),
+                    bot.loop
+                )
+
+            else:
+                await interaction.response.send_message("[mesh] Interface not connected", ephemeral=True)
+        except Exception as e:
+            await interaction.response.send_message(f"[mesh] Failed to send: {e}", ephemeral=True)
 
 
-    @bot.tree.command(name="nodesearch", description="Search for a specific node by ID or name and print channel busy %", guild=guild_obj)
+    @bot.tree.command(name="nodedatagraph", description="Search for a specific node and generate a data graph", guild=guild_obj)
     @app_commands.autocomplete(node_id=nodesearch_autocomplete)
-    async def nodesearch(interaction: discord.Interaction, node_id: str):
+    @app_commands.choices(
+        key=[
+            app_commands.Choice(name="Battery Level", value="batteryLevel"),
+            app_commands.Choice(name="Air Utilization TX", value="airUtilTx"),
+            app_commands.Choice(name="Channel Utilization", value="channelUtilization"),
+            app_commands.Choice(name="Uptime Seconds", value="uptimeSeconds")
+        ]
+    )
+    async def nodesearch(
+        interaction: discord.Interaction,
+        node_id: str,
+        key: app_commands.Choice[str],
+        months: int
+    ):
         output_channel = discord.utils.get(interaction.guild.text_channels, name="nodes-info")
         if output_channel is None:
             await interaction.response.send_message("Output channel #nodes-info not found.", ephemeral=True)
             return
-        
+
         await interaction.response.send_message(
-            f"Processing search for node ID: {node_id}, output will go to #nodes-info",
+            f"Processing node `{node_id}` with data key `{key.name}` for the past `{months}` month(s). Output will go to #nodes-info.",
             ephemeral=True
         )
 
         conn = None
         try:
             conn, cursor = get_cache_cursor()
-            
+
             cursor.execute("""
                 SELECT macaddr, id, longName, hopsAway, snr, airUtilTx, role, lastHeard, firstSeen
                 FROM nodes
                 WHERE id = ? OR longName LIKE ?
                 LIMIT 1
             """, (node_id, f'%{node_id}%'))
-            
+
             node_data = cursor.fetchone()
-            
+
             if not node_data:
                 await output_channel.send(f"Node '{node_id}' not found.")
                 return
@@ -1039,12 +1046,12 @@ async def register_commands():
             macaddr, nid, longName, hops, snr, airtime, role, lastHeard_ts, firstSeen_iso = node_data
             last_heard_dt = datetime.fromtimestamp(lastHeard_ts)
             first_seen_dt = datetime.fromisoformat(firstSeen_iso)
-            
+
             hours_ago = int((datetime.utcnow() - last_heard_dt).total_seconds() // 3600)
             first_hours_ago = int((datetime.utcnow() - first_seen_dt).total_seconds() // 3600)
 
             fmt = lambda v: f"{v:.2f}" if v is not None else "0.00"
-            
+
             message = (
                 f"**Node Details for '{nid}' ({longName or 'Unknown'})**\n"
                 f"MAC: `{macaddr}`\n"
@@ -1055,10 +1062,10 @@ async def register_commands():
                 f"Last Seen: `{last_heard_dt.strftime('%Y-%m-%d %H:%M:%S UTC')} ({hours_ago} hours ago)`\n"
                 f"First Seen: `{first_seen_dt.strftime('%Y-%m-%d %H:%M:%S UTC')} ({first_hours_ago} hours ago)`"
             )
-            
+
             await output_channel.send(message)
-            # graph generation function and send the file
-            filename, error_message = generate_channel_utilization_graph(nid, macaddr)
+
+            filename, error_message = generate_nodedata_graph(nid, macaddr, key.value)
             if filename:
                 try:
                     graph_file = discord.File(filename)
@@ -1067,8 +1074,6 @@ async def register_commands():
                     os.remove(filename)
             else:
                 await output_channel.send(f"Could not generate graph: {error_message}")
-            
-
 
         except sqlite3.Error as e:
             await output_channel.send(f"Failed to query database: {e}")
@@ -1077,10 +1082,6 @@ async def register_commands():
         finally:
             if conn:
                 conn.close()
-
-
-
-
 
 
 
@@ -1201,6 +1202,7 @@ async def on_ready():
     await register_commands()
     await bot.tree.sync(guild=discord.Object(id=GUILD_ID)) # sync the slash commands
     print("Commands synced!")
+    
 
 # ====== START MESH SESSION ======
 MESH_SESSION = MeshSession(host)
