@@ -34,6 +34,7 @@ meshportnum = os.getenv("MESHPORTNUM")
 INCOMING_CHANNEL_NAME = os.getenv("INCOMING_CHANNEL_NAME")
 MY_ID = os.getenv("MY_NODE_ID") # count num of hops for map from this node as center of map
 permsinteger = os.getenv("DISCORD_BOT_PERMS")
+botspam_output_channel = os.getenv("BOTSPAM_OUTPUT_CHANNELNAME")
 
 # ====== CONFIG ======
 NODE_REFRESH_INTERVAL = 900             # num of seconds to refresh nodedb from device
@@ -862,7 +863,7 @@ async def register_commands():
     @bot.tree.command(name="nodes_local", description="Show cached local nodedb", guild=guild_obj)
     async def nodes_local(interaction: discord.Interaction, hopcountlimit: int = 3):
         # get the dedicated output channel
-        output_channel = discord.utils.get(interaction.guild.text_channels, name="nodes-info")
+        output_channel = discord.utils.get(interaction.guild.text_channels, name=botspam_output_channel)
         if output_channel is None:
             await interaction.response.send_message("Output channel #nodes-info not found.", ephemeral=True)
             return
@@ -1016,7 +1017,7 @@ async def register_commands():
         key: app_commands.Choice[str],
         months: int
     ):
-        output_channel = discord.utils.get(interaction.guild.text_channels, name="nodes-info")
+        output_channel = discord.utils.get(interaction.guild.text_channels, name=botspam_output_channel)
         if output_channel is None:
             await interaction.response.send_message("Output channel #nodes-info not found.", ephemeral=True)
             return
@@ -1090,7 +1091,7 @@ async def register_commands():
         # deduplicate results by hw addr 
         # Shows nodes whose firstSeen timestamp is within the last 'hours' number of hours,
 
-        output_channel = discord.utils.get(interaction.guild.text_channels, name="nodes-info")
+        output_channel = discord.utils.get(interaction.guild.text_channels, name=botspam_output_channel)
         if output_channel is None:
             await interaction.response.send_message("Output channel #nodes-info not found.", ephemeral=True)
             return
