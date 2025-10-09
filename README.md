@@ -54,6 +54,7 @@ HISTORY_DB_FILE = nodes_history.db
 AUTHORIZED_SEND_USERS = numeric ID of the discord user, comma separated if you want multiple users authed
 MESHPORTNUM = 4403
 INCOMING_CHANNEL_NAME = mesh-incoming
+BOTSPAM_OUTPUT_CHANNELNAME = nodes-info
 MY_NODE_ID = !1123abc987 
 DISCORD_BOT_PERMS = 274877941760
 ```
