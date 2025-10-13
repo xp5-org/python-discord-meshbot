@@ -27,7 +27,12 @@ This Python bot will:
 Things it should have but doesnt:
 - some logging visible to the admin via discord, record events like disconnects or python errors. currently need to check on it manually from the terminal where it was run from
 - better status function, current one pings the node-ip and
-- recovery from wifi packet loss. If your wifi drops out for a moment when you are receiving a message, its lost. This is how meshtastic works and nothing to do with this bot. Meshtastic API does not have any store or retry mechanism so if you dont catch the messages for whatever reason they are lost. 
+- recovery from wifi packet loss. If your wifi drops out for a moment when you are receiving a message, its lost. This is how meshtastic works and nothing to do with this bot. Meshtastic API does not have any store or retry mechanism so if you dont catch the messages for whatever reason they are lost.
+
+Known problems:
+- meshtastic has an outstanding bug which can affect any use of python in receiving tcp events
+- https://github.com/meshtastic/firmware/issues/5764
+- summary of this is - the meshbot (or any other python script left running) will disconnect and fail to receive data. the error takes place in the meshtastic API and the error message is not passed on down to the listener
 
 <br>
 
