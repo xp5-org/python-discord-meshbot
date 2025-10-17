@@ -420,7 +420,7 @@ class MeshSession:
                 with self.node_list_lock:
                     info = next((info for nid, info in self.node_list if nid == fromnum), {})
 
-                long_name = info.get('longName', f"Meshtastic {fromnum[-4:]}")
+                long_name = info.get('longName', f"Meshtastic {str(fromnum)[-4:]}")
                 hops = info.get('hopsAway', '?')
                 snr = info.get('snr', None)
                 role = info.get('role', 'none')
