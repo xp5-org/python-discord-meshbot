@@ -1,4 +1,4 @@
-#  Meshtastic bot for Discord
+#  Meshtastic bot for Discord + Flask OSM Tile Server
 
 ## Overview
 
@@ -170,4 +170,19 @@ the message is mirrored in the mesh-incoming channel
 <img width="389" height="150" alt="image" src="https://github.com/user-attachments/assets/f84f1ba4-4f14-49f2-ac38-832f39642774" />
 
 
+# Flask OSM Tile Server
+
+I set up an openstreetmap tile server and ran a tool to convert the tiles to .png . the northwest USA region of WA/ID/OR occupies roughly 350MB space at zoom-level 12 which is zoomed in enough to identify the basic structure of city streets and individual city blocks. zoom levels less than this will take up signficantly less space. 
+
+tile server demo: ```mytilemap.py```
+
+convert node cache DB to json: ```nodecache2json.py```
+
+this is taking the "node cache database" from the discord meshbot and plotting green dots for nodes it has received Lat/Lon GPS telemetry data into the meshtastic nodeDb. Nodes which have not reported telemetry are red-dots, and are lumped together to the nearest-neighbor with valid lat/lon GPS location organized by hop count.
+
+this is a simple demo of how to take a list of node IDs, Lat/Lon gps info mixed in with no-gps-telemetry nodes, and plot them on a live map
+
+<br>
+
+<img width="790" height="660" alt="image" src="https://github.com/user-attachments/assets/197f5633-f027-420d-ab00-27e9ba76fd59" />
 
