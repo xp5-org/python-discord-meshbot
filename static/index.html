@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>Leaflet Tile Map</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<style>#map { height: 100vh; width: 100%; }</style>
+</head>
+<body>
+<div id="map"></div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+var map = L.map('map').setView([48.7128, -117.0060], 12);
+L.tileLayer('http://192.168.1.2:5001/tiles/{z}/{x}/{y}.png', {maxZoom: 12}).addTo(map);
+
+fetch('/points')
+.then(r => r.json())
+.then(points => {
+    const grouped = {};
+    points.forEach(p => {
+        if (!grouped[p.hops]) grouped[p.hops] = [];
+        grouped[p.hops].push(p);
+    });
+
+    const scatter = 0.1; // not sure what size this is
+    for (const hop in grouped) {
+        const hopPoints = grouped[hop];
+        const valid = hopPoints.filter(p => p.lat !== null && p.lon !== null);
+        const invalid = hopPoints.filter(p => p.lat === null || p.lon === null);
+
+        let avgLat = null, avgLon = null;
+        if (valid.length) {
+            avgLat = valid.reduce((a, b) => a + b.lat, 0) / valid.length;
+            avgLon = valid.reduce((a, b) => a + b.lon, 0) / valid.length;
+        }
+
+        invalid.forEach(p => {
+            if (avgLat !== null && avgLon !== null) {
+                const dLat = (Math.random() - 0.5) * scatter;
+                const dLon = (Math.random() - 0.5) * scatter;
+                p.lat = avgLat + dLat;
+                p.lon = avgLon + dLon;
+            } else {
+                p.lat = CENTER_LAT + (Math.random() - 0.5) * scatter;
+                p.lon = CENTER_LON + (Math.random() - 0.5) * scatter;
+            }
+        });
+    }
+
+    points.forEach(p => {
+        L.circleMarker([p.lat, p.lon], {color: p.color, radius: 5})
+        .addTo(map)
+        .bindPopup(
+        "ID: " + p.id +
+        "<br>Hops: " + p.hops +
+        "<br>Latitude: " + p.lat +
+        "<br>Longitude: " + p.lon +
+        "<br>Color: " + p.color
+        );
+    });
+});
+</script>
+</body>
+</html>
