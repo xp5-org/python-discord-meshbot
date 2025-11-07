@@ -104,8 +104,6 @@ its set up like this
 
 # using the commands
 This has the following:
-- hopmap
--- plot a simple map of where the nodes are (needs a lot of work and polish)
 - newnodes
 - nodedatagraph
 - nodes_local
