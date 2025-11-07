@@ -1,5 +1,7 @@
-import os, io, time, json, threading, asyncio, re, random, math
-from datetime import datetime, timedelta
+import os, time, threading, asyncio, re
+from datetime import datetime, timezone, timedelta
+import sqlite3
+import logging
 
 import discord
 from discord.ext import commands
@@ -13,33 +15,23 @@ from pubsub import pub  # pip install pypubsub
 import matplotlib
 matplotlib.use("Agg")  # Must come before importing pyplot
 import matplotlib.pyplot as plt
-import aiosqlite
-import io
-import math
-import matplotlib.pyplot as plt
-import os
-import random
-import sqlite3, aiosqlite
+
 from dotenv import load_dotenv
 
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-CENTER_LAT = os.getenv("CENTER_LAT")
-CENTER_LON = os.getenv("CENTER_LON")
 host = os.getenv("MESHNODE_IP")
 NODE_CACHE_DB = os.getenv("NODE_CACHE_DB")
 HISTORY_DB_FILE = os.getenv("HISTORY_DB_FILE")
 meshportnum = os.getenv("MESHPORTNUM")
 INCOMING_CHANNEL_NAME = os.getenv("INCOMING_CHANNEL_NAME")
-MY_ID = os.getenv("MY_NODE_ID") # count num of hops for map from this node as center of map
+MY_ID = os.getenv("MY_NODE_ID") # used to set discord-bot-node host as hop0 instead of empty val
 permsinteger = os.getenv("DISCORD_BOT_PERMS")
 botspam_output_channel = os.getenv("BOTSPAM_OUTPUT_CHANNELNAME")
 
 # ====== CONFIG ======
 NODE_REFRESH_INTERVAL = 900             # num of seconds to refresh nodedb from device
-MAX_DISTANCE_KM = 500 # ignore client gps info if its bigger than this value
-OUTLIER_MARGIN = 0.85 # variance tolerance on mapping
 CLEANUP_INTERVAL = 14400  # node_history deduplication every 4hrs
 
 AUTHORIZED_SEND_USERS = [
@@ -47,24 +39,40 @@ AUTHORIZED_SEND_USERS = [
 ]
 
 
-
+# discord guild settings
 intents = discord.Intents.default()
 intents.guilds = True
+intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 MESH_SESSION = None
 GUILD_ID = None
 
 
+
+# debug logging from the meshapi
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    filename="debuglog.txt",
+    filemode="a"
+)
+logging.info("\n\n========== CLIENT STARTING ==========\n\n")
+
+
+
 class MeshSession:
     def __init__(self, host):
         self.node_ip = host
+        self.meshportnum = meshportnum
         self.node_list = []
         self.node_list_lock = threading.Lock()
         self.my_node_id = None
         self.interface = None
         self.online = False
         self._stop_event = threading.Event()
-
+        # add pub subscrive for disconnect events
+        pub.subscribe(self.on_disconnect, 'meshtastic.connection.lost')
         # background thread for db connections, cant block the mesh api or messages will be lost
         threading.Thread(target=self._background_loop, daemon=True).start()
 
@@ -135,6 +143,7 @@ class MeshSession:
                     print("[mesh] History database ready.")
 
                 if not self.online or not self._reader_alive():
+                    time.sleep(5) # for debugging testing, wait 5 seconds before attempting connect
                     self.connect()
 
                 # only pull from mesh device if x amount of time has passed
@@ -233,7 +242,7 @@ class MeshSession:
         # tcp/ip path
         print(f"[mesh] Connecting to {self.node_ip} via TCP...")
         try:
-            self.interface = TCPInterface(hostname=self.node_ip, portNumber="4404")
+            self.interface = TCPInterface(hostname=self.node_ip, portNumber=self.meshportnum)
             pub.subscribe(self.on_receive, "meshtastic.receive")
             self.online = True
             print("[mesh] TCP connection established")
@@ -243,11 +252,14 @@ class MeshSession:
             print(f"[mesh] Failed to connect via TCP: {e}")
 
 
-
-
-
-
-
+    def on_disconnect(self, interface):
+        print(f"{datetime.now():%Y-%m-%d %H:%M:%S} [mesh] Connection lost, attempting reconnect...")
+        try:
+            interface.close()
+        except Exception:
+            pass
+        self.interface = None
+        self.online = False
 
 
     def fetch_nodes(self, cache_conn, cache_cursor, history_conn, history_cursor):
@@ -255,8 +267,8 @@ class MeshSession:
             raise RuntimeError("Not connected to mesh host")
 
         print("[mesh] Fetching and logging nodes from mesh...")
-        current_time_iso = datetime.utcnow().isoformat()
-        current_time_ts = int(datetime.utcnow().timestamp())
+        current_time_iso = datetime.now(timezone.utc).isoformat()
+        current_time_ts = int(datetime.now(timezone.utc).timestamp())
         nodes_to_process = self.interface.nodes.copy()
         try:
             for node_id, node in nodes_to_process.items():
@@ -266,7 +278,7 @@ class MeshSession:
 
                 hops_raw = node.get("hopsAway")
 
-                if node_id == MY_ID:
+                if node_id == MY_ID: # set the discord-bot-node as hop0
                     hops = 0
 
                 try:
@@ -319,7 +331,7 @@ class MeshSession:
 
                     # lifecycle
                     "lastHeard": current_time_ts,
-                    "firstSeen": datetime.utcnow().isoformat()
+                    "firstSeen": datetime.now(timezone.utc).isoformat()
                 }
 
                 # check if node exists in cache
@@ -516,222 +528,6 @@ def get_cache_cursor():
     return conn, cursor
 
 
-def latlon_to_km(lat, lon, center_lat, center_lon):
-    try:
-        if lat is None or lon is None or center_lat is None or center_lon is None:
-            return None, None
-        
-        lat = float(lat)
-        lon = float(lon)
-        center_lat = float(center_lat)
-        center_lon = float(center_lon)
-
-        earth_radius_km = 6371.0
-
-        lat_rad = math.radians(lat)
-        lon_rad = math.radians(lon)
-        center_lat_rad = math.radians(center_lat)
-        center_lon_rad = math.radians(center_lon)
-
-        x = earth_radius_km * (lon_rad - center_lon_rad) * math.cos((lat_rad + center_lat_rad) / 2)
-        y = earth_radius_km * (lat_rad - center_lat_rad)
-        return x, y
-    except (ValueError, TypeError):
-        return None, None
-
-
-async def generate_hopmap_png(max_hops: int, filename: str):
-    if not os.path.exists(NODE_CACHE_DB):
-        raise RuntimeError("No cache file found")
-
-    nodes = {}
-    async with aiosqlite.connect(NODE_CACHE_DB) as db:
-        async with db.execute(
-            "SELECT id, latitude, longitude, hopsAway FROM nodes WHERE hopsAway BETWEEN 0 AND ?",
-            (max_hops,)
-        ) as cursor:
-            async for row in cursor:
-                nid, lat, lon, hops = row
-                #print('NodeID: ', nid)
-
-                try:
-                    lat = float(lat)
-                except (ValueError, TypeError):
-                    lat = None
-
-                try:
-                    lon = float(lon)
-                except (ValueError, TypeError):
-                    lon = None
-
-                try:
-                    hops = int(hops)
-                except (ValueError, TypeError):
-                    hops = None
-                
-                print(nid)
-
-                if nid == MY_ID:
-                    #print('found my node and fixing the hop count')
-                    hops = 0
-                    if lat is None or lon is None:
-                        lat = CENTER_LAT
-                        lon = CENTER_LON
-                        
-                if hops not in nodes:
-                    nodes[hops] = []
-
-                nodes[hops].append({
-                    "_id": nid,
-                    "position": {"latitude": lat, "longitude": lon},
-                    "hopsAway": hops
-                })
-
-    plt.figure(figsize=(8, 8))
-    gps_positions_by_hop = {i: [] for i in range(max_hops + 1)}
-    
-    for hop_count in sorted(nodes.keys()):
-        node_list = nodes[hop_count]
-        valid_positions = []
-        outliers = []
-
-        for n in node_list:
-            lat = n["position"]["latitude"]
-            lon = n["position"]["longitude"]
-
-            if lat is None or lon is None:
-                n["xy"] = None
-                continue  # skip invalid coordinates
-
-            x, y = latlon_to_km(lat, lon, CENTER_LAT, CENTER_LON)
-
-            if x is None or y is None:
-                n["xy"] = None
-                continue  # skip failed conversion
-
-            n["xy"] = (x, y)
-            distance = math.hypot(x, y)
-
-            if distance <= MAX_DISTANCE_KM:
-                valid_positions.append((x, y))
-            else:
-                outliers.append((x, y))
-
-        # Only store the valid positions in gps_positions_by_hop
-        gps_positions_by_hop[hop_count] = valid_positions
-
-
-
-
-    
-    gps_positions = [pos for sublist in gps_positions_by_hop.values() for pos in sublist]
-    
-    # --- Scaling Logic ---
-    if gps_positions:
-        xs, ys = zip(*gps_positions)
-        max_dist = max(max(abs(x) for x in xs), max(abs(y) for y in ys)) if xs and ys else 0
-
-        MIN_MAP_RANGE_HALF = 10  # 10km from center
-
-        # For hop‑0, force your node to (0,0) and center the map
-        if max_hops == 0:
-            # Override gps_positions to contain only your node at 0,0
-            gps_positions = [(0.0, 0.0)]
-            max_plot_range = MIN_MAP_RANGE_HALF
-            plt.xlim(-max_plot_range, max_plot_range)
-            plt.ylim(-max_plot_range, max_plot_range)
-        else:
-            # Determine final map range based on max distance or a minimum
-            if max_dist < MIN_MAP_RANGE_HALF:
-                max_plot_range = MIN_MAP_RANGE_HALF
-            else:
-                max_plot_range = max_dist * 1.40
-
-            plt.xlim(-max_plot_range, max_plot_range)
-            plt.ylim(-max_plot_range, max_plot_range)
-    else:
-        max_plot_range = 20 * max_hops
-        plt.xlim(-max_plot_range, max_plot_range)
-        plt.ylim(-max_plot_range, max_plot_range)
-
-    scatter_radius = (plt.xlim()[1] - plt.xlim()[0]) * 0.05
-    
-
-    for hop_count in sorted(nodes.keys()):
-        node_list = nodes[hop_count]
-        valid_positions = []
-        outliers = []
-
-        # classify nodes as valid or outlier
-        for n in node_list:
-            lat = n["position"]["latitude"]
-            lon = n["position"]["longitude"]
-
-            if lat is None or lon is None:
-                n["xy"] = None
-                continue
-
-            x, y = latlon_to_km(lat, lon, CENTER_LAT, CENTER_LON)
-            n["xy"] = (x, y)
-
-            if x is None or y is None:
-                continue
-
-            distance = math.hypot(x, y)
-            if distance <= MAX_DISTANCE_KM:
-                valid_positions.append((x, y))
-            else:
-                outliers.append((x, y))
-
-        gps_positions_by_hop[hop_count] = valid_positions
-
-        # Plot nodes
-        for n in node_list:
-            node_id = n["_id"]
-
-            if n["xy"] is not None and n["xy"] in valid_positions:
-                x, y = n["xy"]
-                color = "green"
-            elif n["xy"] is not None and n["xy"] in outliers:
-                # Place outliers near the edge
-                x, y = n["xy"]
-                distance = math.hypot(x, y)
-                scale = OUTLIER_MARGIN * max_plot_range / distance
-                x *= scale
-                y *= scale
-                color = "red"
-            else:
-                # Fallback: scatter around other valid nodes
-                if valid_positions:
-                    base_x, base_y = random.choice(valid_positions)
-                    x = base_x + random.uniform(-scatter_radius, scatter_radius)
-                    y = base_y + random.uniform(-scatter_radius, scatter_radius)
-                else:
-                    x = y = 0
-                color = "red"
-
-            plt.scatter(x, y, color=color, s=50)
-            plt.annotate(node_id, (x, y), xytext=(5, 5), textcoords="offset points",
-                        fontsize=8, color=color)
-
-
-
-    plt.xlabel("East (km)")
-    plt.ylabel("North (km)")
-    total_nodes = sum(len(lst) for lst in nodes.values())
-    plt.title(f"num nodes {total_nodes} : num hops {max_hops}")
-    plt.grid(True)
-    plt.axis("equal")
-    plt.tight_layout()
-
-    plt.savefig(filename, dpi=300, bbox_inches="tight")
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png", dpi=300, bbox_inches="tight")
-    buf.seek(0)
-    plt.close()
-    return buf
-
-
 async def send_to_discord(text):
     channel = discord.utils.get(bot.get_all_channels(), name=INCOMING_CHANNEL_NAME)
     if channel:
@@ -836,28 +632,6 @@ async def register_commands():
 
     GUILD_ID = bot.guilds[0].id
     guild_obj = discord.Object(id=GUILD_ID)
-
-
-
-    @bot.tree.command(name="hopmap", description="Plot mesh nodes up to N hops", guild=guild_obj)
-    async def hopmap(interaction: discord.Interaction, hops: int = 1):
-        await interaction.response.defer()
-
-        try:
-            filename = f"meshplot_{hops}.png"
-            buf = await generate_hopmap_png(hops, filename)
-
-            # send to #bot-commands channel
-            output_channel = discord.utils.get(interaction.guild.text_channels, name="bot-commands")
-            if output_channel is None:
-                await interaction.followup.send("Channel #bot-commands not found.")
-                return
-
-            file = discord.File(buf, filename=filename)
-            await output_channel.send(file=file)
-            await interaction.followup.send(f"Hopmap for {hops} hops generated.", ephemeral=True)
-        except Exception as e:
-            await interaction.followup.send(f"Failed to generate hopmap: {e}", ephemeral=True)
 
 
     @bot.tree.command(name="nodes_local", description="Show cached local nodedb", guild=guild_obj)
