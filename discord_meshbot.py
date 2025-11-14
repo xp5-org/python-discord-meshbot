@@ -1,4 +1,4 @@
-import os, time, threading, asyncio, re
+import os, sys, time, threading, asyncio, re
 from datetime import datetime, timezone, timedelta
 import sqlite3
 import logging
@@ -7,6 +7,21 @@ import discord
 from discord.ext import commands
 from discord import Interaction
 from discord import app_commands
+
+
+# block of code for using local git branch instead of importing meshapi from pip
+local_repo = r"/bigpool/data/code_projects/meshtastic_github/xp5fork_meshastic-python-library"
+if os.path.isdir(local_repo):
+    sys.path.insert(0, local_repo)
+
+from meshtastic import tcp_interface
+
+import meshtastic
+print("using the following meshtcp library path: ", meshtastic.tcp_interface.__file__)
+# end block of patched in stuff
+
+
+
 
 from meshtastic.tcp_interface import TCPInterface
 from meshtastic.serial_interface import SerialInterface
@@ -31,8 +46,8 @@ permsinteger = os.getenv("DISCORD_BOT_PERMS")
 botspam_output_channel = os.getenv("BOTSPAM_OUTPUT_CHANNELNAME")
 
 # ====== CONFIG ======
-NODE_REFRESH_INTERVAL = 900             # num of seconds to refresh nodedb from device
-CLEANUP_INTERVAL = 14400  # node_history deduplication every 4hrs
+NODE_REFRESH_INTERVAL = 900 # num of seconds to refresh nodedb from device
+CLEANUP_INTERVAL = 14400 # node_history deduplication every 4hrs
 
 AUTHORIZED_SEND_USERS = [
     int(x.strip()) for x in os.getenv("AUTHORIZED_SEND_USERS", "").split(",") if x.strip()
@@ -71,20 +86,57 @@ class MeshSession:
         self.interface = None
         self.online = False
         self._stop_event = threading.Event()
-        # add pub subscrive for disconnect events
-        pub.subscribe(self.on_disconnect, 'meshtastic.connection.lost')
-        # background thread for db connections, cant block the mesh api or messages will be lost
-        threading.Thread(target=self._background_loop, daemon=True).start()
+        self._shutdown_requested = False
+        # add pub subscribe for disconnect events
+        pub.subscribe(self._set_tcpshutdown_disconnect, 'meshtastic.connection.lost')
+        # thread for db connections, cant block the mesh api or messages will be lost
+        self._db_thread = threading.Thread(target=self._databasebackground_loop, daemon=True)
+        self._db_thread.start()
+        # thread for connection to mesh api
+        self._conn_thread = threading.Thread(target=self._meshconnection_loop, daemon=True)
+        self._conn_thread.start()
 
 
-    def _background_loop(self):
+
+    def _meshconnection_loop(self):
+        while not self._stop_event.is_set() and not self._shutdown_requested:
+            if not self.online:
+                self.connect_node()
+            time.sleep(1) # limits the thread to spinning once per second
+
+
+    def _databasebackground_loop(self):
         last_refresh = 0
         last_cleanup = 0
-        cache_conn, cache_cursor = None, None
-        history_conn, history_cursor = None, None
-        
+        cache_conn, cache_cursor, history_conn, history_cursor = None, None, None, None
+        while not self._stop_event.is_set():
+            if cache_conn is None or history_conn is None:
+                cache_conn, cache_cursor, history_conn, history_cursor = self.connect_db()
+                if cache_conn is None:
+                    time.sleep(1)
+                    continue
 
-        # key values were valid for 2.6.11 , might change in the future
+            now_ts = time.time()
+
+            if self.online and (now_ts - last_refresh >= NODE_REFRESH_INTERVAL):
+                # get node db from mesh device only if connected & time passed
+                self.fetch_nodes(cache_conn, cache_cursor, history_conn, history_cursor)
+                last_refresh = now_ts
+
+            if now_ts - last_cleanup >= CLEANUP_INTERVAL:
+                # run db duplicate cleanup on initial db connect
+                threading.Thread(target=cleanup_history_db, args=(HISTORY_DB_FILE,), daemon=True).start()
+                last_cleanup = now_ts
+
+            time.sleep(1) # prevent bg loop from spinning too fast
+
+        # close db's if "while not stop event" is set
+        if cache_conn: cache_conn.close()
+        if history_conn: history_conn.close()
+        print("[mesh] All database connections closed.")
+
+
+    def connect_db(self):
         COMMON_COLUMNS = """
             id TEXT,
             longName TEXT,
@@ -123,57 +175,82 @@ class MeshSession:
         CACHE_COLUMNS = COMMON_COLUMNS + ", lastHeard INTEGER, firstSeen TEXT"
         HISTORY_COLUMNS = "timestamp TEXT, " + COMMON_COLUMNS
 
-        while not self._stop_event.is_set():
+        try:
+            cache_conn = sqlite3.connect(NODE_CACHE_DB)
+            cache_conn.row_factory = sqlite3.Row
+            cache_cursor = cache_conn.cursor()
+            # if the db doesnt exist or is missing the table, create one
+            cache_cursor.execute(f"CREATE TABLE IF NOT EXISTS nodes ({CACHE_COLUMNS})")
+            cache_conn.commit()
+
+            history_conn = sqlite3.connect(HISTORY_DB_FILE)
+            history_cursor = history_conn.cursor()
+            # if the db doesnt exist or is missing the table, create one
+            history_cursor.execute(f"CREATE TABLE IF NOT EXISTS node_history ({HISTORY_COLUMNS})")
+            history_conn.commit()
+
+            print("[mesh] Database connections ready.")
+            return cache_conn, cache_cursor, history_conn, history_cursor
+
+        except sqlite3.Error as e:
+            print(f"[mesh] Database connection failed: {e}")
+            if cache_conn: cache_conn.close()
+            if history_conn: history_conn.close()
+            return None, None, None, None
+
+
+    def connect_node(self):
+        if self.interface:
             try:
-                if cache_conn is None:
-                    print("[mesh] Connecting to cache database...")
-                    cache_conn = sqlite3.connect(NODE_CACHE_DB)
-                    cache_conn.row_factory = sqlite3.Row  # enables dict-like rows
-                    cache_cursor = cache_conn.cursor()
-                    cache_cursor.execute(f"CREATE TABLE IF NOT EXISTS nodes ({CACHE_COLUMNS})")
-                    cache_conn.commit()
+                self.interface.close() # close if already open for some reason
+            except Exception:
+                pass
+            self.interface = None
+        print("debug: sleeping 5 seconds before connecting to meshtastic tcp path")
+        time.sleep(5) # give mesh device time, for debugging
 
-
-                if history_conn is None:
-                    print("[mesh] Connecting to history database...")
-                    history_conn = sqlite3.connect(HISTORY_DB_FILE)
-                    history_cursor = history_conn.cursor()
-                    history_cursor.execute(f"CREATE TABLE IF NOT EXISTS node_history ({HISTORY_COLUMNS})")
-                    history_conn.commit()
-                    print("[mesh] History database ready.")
-
-                if not self.online or not self._reader_alive():
-                    time.sleep(5) # for debugging testing, wait 5 seconds before attempting connect
-                    self.connect()
-
-                # only pull from mesh device if x amount of time has passed
-                now_ts = time.time()
-
-                if self.online and (now_ts - last_refresh >= NODE_REFRESH_INTERVAL):
-                    self.fetch_nodes(cache_conn, cache_cursor, history_conn, history_cursor)
-                    last_refresh = now_ts
-
-                if now_ts - last_cleanup >= CLEANUP_INTERVAL:
-                    threading.Thread(target=cleanup_history_db, args=(HISTORY_DB_FILE,), daemon=True).start()
-                    last_cleanup = now_ts
-
-                time.sleep(1) # small delay for thread to establish
-
-            except sqlite3.Error as e:
-                print(f"[mesh] Database error: {e}")
-                if cache_conn: cache_conn.close()
-                if history_conn: history_conn.close()
-                cache_conn, cache_cursor, history_conn, history_cursor = None, None, None, None
+        # serial connect path
+        if self.node_ip.lower() == "serial":
+            print("[mesh] Connecting via serial interface...")
+            try:
+                self.interface = SerialInterface()
+                pub.subscribe(self.on_receive, "meshtastic.receive")
+                self.online = True
+                print("[mesh] Serial connection established")
             except Exception as e:
-                print(f"[mesh] General error in background loop: {e}")
-                self.online = False
-                if cache_conn: cache_conn.close()
-                if history_conn: history_conn.close()
-                cache_conn, cache_cursor, history_conn, history_cursor = None, None, None, None
+                self.interface = None
+                print(f"[mesh] Failed to connect via serial: {e}")
+            return
 
-        if cache_conn: cache_conn.close()
-        if history_conn: history_conn.close()
-        print("[mesh] All database connections closed.")
+        # tcp/ip path
+        print(f"[mesh] Connecting to {self.node_ip} via TCP...")
+        try:
+            self.interface = TCPInterface(hostname=self.node_ip, portNumber=self.meshportnum)
+            pub.subscribe(self.on_receive, "meshtastic.receive")
+            self.online = True
+            print("[mesh] TCP connection established")
+        except Exception as e:
+            if self.interface:
+                try:
+                    self._set_tcpshutdown_disconnect()
+                except Exception:
+                    pass
+            print(f"[mesh] Failed to connect via TCP: {e}")
+
+
+    def _set_tcpshutdown_disconnect(self, interface=None):
+        if self.interface:
+            try:
+                print(f"{datetime.now():%Y-%m-%d %H:%M:%S} [mesh] tcp shutdown called, attempting reconnect...")
+                self.interface.close()
+            except Exception:
+                print("[mesh] Exception closing TCP interface")
+        else:
+            print("[mesh] tcp shutdown called. No interface to close")
+
+        self.interface = None
+        self.online = False
+
 
     def _load_nodes_from_db(self, cursor):
         with self.node_list_lock:
@@ -208,58 +285,6 @@ class MeshSession:
                     (nid for nid, info in self.node_list if info.get("role") == "self"),
                     None
                 )
-
-
-
-    def _reader_alive(self):
-        return self.online and self.interface is not None
-
-
-    def connect(self):
-        if self.interface:
-            try:
-                self.interface.close()
-            except Exception:
-                pass
-            self.interface = None
-            self.online = False
-
-
-        # serial connect path
-        if self.node_ip.lower() == "serial":
-            print("[mesh] Connecting via serial interface...")
-            try:
-                self.interface = SerialInterface()
-                pub.subscribe(self.on_receive, "meshtastic.receive")
-                self.online = True
-                print("[mesh] Serial connection established")
-            except Exception as e:
-                self.interface = None
-                self.online = False
-                print(f"[mesh] Failed to connect via serial: {e}")
-            return
-
-        # tcp/ip path
-        print(f"[mesh] Connecting to {self.node_ip} via TCP...")
-        try:
-            self.interface = TCPInterface(hostname=self.node_ip, portNumber=self.meshportnum)
-            pub.subscribe(self.on_receive, "meshtastic.receive")
-            self.online = True
-            print("[mesh] TCP connection established")
-        except Exception as e:
-            self.interface = None
-            self.online = False
-            print(f"[mesh] Failed to connect via TCP: {e}")
-
-
-    def on_disconnect(self, interface):
-        print(f"{datetime.now():%Y-%m-%d %H:%M:%S} [mesh] Connection lost, attempting reconnect...")
-        try:
-            interface.close()
-        except Exception:
-            pass
-        self.interface = None
-        self.online = False
 
 
     def fetch_nodes(self, cache_conn, cache_cursor, history_conn, history_cursor):
@@ -417,10 +442,15 @@ class MeshSession:
 
         except Exception as e:
             print(f"[mesh] Exception fetching nodes: {e}")
-            self.online = False
+            if self.interface:
+                try:
+                    self._set_tcpshutdown_disconnect()
+                except Exception:
+                    pass
+            print(f"[mesh] Failed to connect via TCP: {e}")
 
-# this forwards received messages onto discord
-    def on_receive(self, packet, interface):
+
+    def on_receive(self, packet, interface): # this forwards received messages onto discord
         if not self.online:
             return
         try:
@@ -473,14 +503,12 @@ class MeshSession:
 
 
 
-    def stop(self):
-        self._stop_event.set()  # signal loops to stop
-        if self.interface:
-            try:
-                self.interface.close()
-            except Exception:
-                pass
-        self.online = False
+
+
+
+
+
+
 
 
 def cleanup_history_db(db_path):
