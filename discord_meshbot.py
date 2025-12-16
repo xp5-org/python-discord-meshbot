@@ -1,22 +1,22 @@
 import os, sys, time, threading, asyncio, re
 from datetime import datetime, timezone, timedelta
 import sqlite3
-import logging
+import json
+#import logging
 
 import discord
 from discord.ext import commands
 from discord import Interaction
 from discord import app_commands
 
-
 # block of code for using local git branch instead of importing meshapi from pip
-local_repo = r"/bigpool/data/code_projects/meshtastic_github/xp5fork_meshastic-python-library"
-if os.path.isdir(local_repo):
-    sys.path.insert(0, local_repo)
+#local_repo = r"/bigpool/data/code_projects/meshtastic_github/xp5fork_meshastic-python-library"
+#if os.path.isdir(local_repo):
+#    sys.path.insert(0, local_repo)
 
-from meshtastic import tcp_interface
-
+#from meshtastic import tcp_interface
 import meshtastic
+
 print("using the following meshtcp library path: ", meshtastic.tcp_interface.__file__)
 # end block of patched in stuff
 
@@ -48,16 +48,15 @@ botspam_output_channel = os.getenv("BOTSPAM_OUTPUT_CHANNELNAME")
 # ====== CONFIG ======
 NODE_REFRESH_INTERVAL = 900 # num of seconds to refresh nodedb from device
 CLEANUP_INTERVAL = 14400 # node_history deduplication every 4hrs
-
 AUTHORIZED_SEND_USERS = [
     int(x.strip()) for x in os.getenv("AUTHORIZED_SEND_USERS", "").split(",") if x.strip()
 ]
 
 
 # discord guild settings
-intents = discord.Intents.default()
+intents = discord.Intents.all()
 intents.guilds = True
-intents.message_content = True
+#intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 MESH_SESSION = None
 GUILD_ID = None
@@ -65,14 +64,14 @@ GUILD_ID = None
 
 
 # debug logging from the meshapi
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    filename="debuglog.txt",
-    filemode="a"
-)
-logging.info("\n\n========== CLIENT STARTING ==========\n\n")
+#logging.basicConfig(
+#    level=logging.DEBUG,
+#    format="%(asctime)s [%(levelname)s] %(message)s",
+#    datefmt="%Y-%m-%d %H:%M:%S",
+#    filename="debuglog.txt",
+#    filemode="a"
+#)
+#logging.info("\n\n========== CLIENT STARTING ==========\n\n")
 
 
 
@@ -95,6 +94,34 @@ class MeshSession:
         # thread for connection to mesh api
         self._conn_thread = threading.Thread(target=self._meshconnection_loop, daemon=True)
         self._conn_thread.start()
+        self.pending_captures = {} # for dm rx auth code
+        self.active_captures = {}   # maps node_id -> discord.User for dm rx
+
+    def save_capture_state(self):
+        data = {
+            "pending_captures": {
+                nid: {"code": entry["code"], "discord_user_id": entry["discord_user"].id}
+                for nid, entry in self.pending_captures.items()
+            },
+            "active_captures": self.active_captures
+        }
+        with open("captures_state.json", "w") as f:
+            json.dump(data, f)
+
+    def load_capture_state(self):
+        try:
+            with open("captures_state.json", "r") as f:
+                data = json.load(f)
+        except OSError:
+            return
+        self.active_captures = data.get("active_captures", {})
+        self.pending_captures = {
+            nid: {"code": entry["code"], "discord_user_id": entry["discord_user_id"]}
+            for nid, entry in data.get("pending_captures", {}).items()}
+        print("loading capture info", MESH_SESSION.pending_captures)
+
+
+
 
 
 
@@ -468,45 +495,111 @@ class MeshSession:
                 role = info.get('role', 'none')
                 channel_utilization = info.get("channelUtilization", None)
 
-
                 to_id = packet.get('toId') or decoded_packet.get('to')
-                if to_id is None or to_id == '^all':
-                    prefix = "C]"
-                elif to_id == self.my_node_id:
-                    prefix = "D]"
-                else:
-                    prefix = "UNK]"
+                print('text-packet received, FROM & TO-ID DEBUG: ', fromnum, to_id)
 
-                if prefix in ("C]", "D]"):
+                if to_id is None or to_id == '^all': # channel msg
                     formatted_text = (
                         # fromnum is the device ID name where shortname is derived
-                        f"Received From: {long_name} - {fromnum}\n"
+                        f"Channel Msg Received From: {long_name} - {fromnum}\n"
                         "```\n"
                         f"{message}\n"
                         "```\n Stats: \n"
                         f"`hops = {hops}`\n"
                         f"`snr  = {snr}`\n"
-                       # f"`role = {role}`"
-                        f"`channel busy % = {channel_utilization}`"
-                    )
-
-
-
+                        f"`channel busy % = {channel_utilization}`")
+                    
                     asyncio.run_coroutine_threadsafe(
-                        send_to_discord(formatted_text),
-                        bot.loop
+                    send_to_discord(formatted_text),
+                    bot.loop)
+
+                elif to_id == MY_ID:
+                    from_node = str(fromnum)
+                    if from_node in MESH_SESSION.pending_captures:
+                        entry = MESH_SESSION.pending_captures[from_node]
+                        if message.strip().upper() == entry["code"]:
+                            user_id = entry["discord_user"].id
+                            MESH_SESSION.active_captures[from_node] = user_id
+                            del MESH_SESSION.pending_captures[from_node]
+
+                            asyncio.run_coroutine_threadsafe(
+                                entry["discord_user"].send(
+                                    f"Capture confirmed for node {from_node}! Forwarding will now go to you."
+                                ),
+                                bot.loop
+                            )
+                            MESH_SESSION.save_capture_state()
+
+
+                        else:
+                            # code did not match, received some other msg. silently remove node from pending list
+                            del MESH_SESSION.pending_captures[from_node]
+
+                            formatted_text = (
+                            # fromnum is the device ID name where shortname is derived
+                            f"DM Received From: {long_name} - {fromnum}\n"
+                            "```\n"
+                            f"{message}\n"
+                            "```\n Stats: \n"
+                            f"`hops = {hops}`\n"
+                            f"`snr  = {snr}`\n"
+                            # f"`role = {role}`"
+                            f"`channel busy % = {channel_utilization}`")
+
+                            # inform requester by DM
+                            asyncio.run_coroutine_threadsafe(
+                                entry["discord_user"].send(f"Capture for node {from_node} failed: incorrect code received. Try again."),
+                                bot.loop
+                            )
+
+                            # forward msg on anyways to regular chat
+                            asyncio.run_coroutine_threadsafe(
+                            send_to_discord(formatted_text),
+                            bot.loop
+                            )
+                            MESH_SESSION.save_capture_state() # store current state of things to disk
+
+                    # forward any messages from active captures to the linked Discord user
+                    if from_node in MESH_SESSION.active_captures:
+                        user_id = MESH_SESSION.active_captures[from_node]
+                        discord_user = bot.get_user(user_id)
+                        if discord_user is not None:
+                            formatted_text = (
+                            # fromnum is the device ID name where shortname is derived
+                            f"Captured DM Received From: {long_name} - {fromnum}\n"
+                            "```\n"
+                            f"{message}\n"
+                            "```\n Stats: \n"
+                            f"`hops = {hops}`\n"
+                            f"`snr  = {snr}`\n"
+                            # f"`role = {role}`"
+                            f"`channel busy % = {channel_utilization}`")
+                            asyncio.run_coroutine_threadsafe(
+                                discord_user.send(formatted_text),
+                                bot.loop
+                                    )
+                            return
+
+                else: # assume the message is a DM, and isnt on the capture list, send DM message to the channel
+                    formatted_text = (
+                        # fromnum is the device ID name where shortname is derived
+                        f"DM Received From: {long_name} - {fromnum}\n"
+                        "```\n"
+                        f"{message}\n"
+                        "```\n Stats: \n"
+                        f"`hops = {hops}`\n"
+                        f"`snr  = {snr}`\n"
+                        # f"`role = {role}`"
+                        f"`channel busy % = {channel_utilization}`")
+                    
+                    asyncio.run_coroutine_threadsafe(
+                    send_to_discord(formatted_text),
+                    bot.loop
                     )
+                    prefix = "UNK]"
+
         except (KeyError, UnicodeDecodeError):
             pass
-
-
-
-
-
-
-
-
-
 
 
 
@@ -630,6 +723,7 @@ def generate_nodedata_graph(node_id, hwaddr, key):
 
 
 async def nodesearch_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    # this is the node-db search function
     conn = None
     try:
         conn, cursor = get_cache_cursor()
@@ -652,6 +746,16 @@ async def nodesearch_autocomplete(interaction: discord.Interaction, current: str
             conn.close()
 
 
+async def node_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    # this is the node-db in-memory-cache only function, doesnt pull from db
+    choices = []
+    with MESH_SESSION.node_list_lock:
+        for node_id, _ in MESH_SESSION.node_list:
+            if current.lower() in node_id.lower():
+                choices.append(app_commands.Choice(name=node_id, value=node_id))
+    return choices[:25]
+
+
 async def register_commands():
     global GUILD_ID
     if not bot.guilds:
@@ -660,6 +764,137 @@ async def register_commands():
 
     GUILD_ID = bot.guilds[0].id
     guild_obj = discord.Object(id=GUILD_ID)
+
+    import random
+
+    @bot.tree.command(name="newdmtest", description="DM-only test command")
+    @app_commands.choices(
+    action=[
+        app_commands.Choice(name="capture", value="capture"),
+        app_commands.Choice(name="status", value="status"),
+        app_commands.Choice(name="clear", value="clear"),
+    ]
+    )
+    @app_commands.autocomplete(node_id=node_autocomplete)
+    async def newdmtest(interaction: discord.Interaction, action: str, node_id: str = None):
+        with MESH_SESSION.node_list_lock:
+            valid_node_ids = [nid for nid, _ in MESH_SESSION.node_list]
+
+        if interaction.guild is not None:
+            await interaction.response.send_message(
+                "This command can only be used in a Direct Message (DM) with the bot.",
+                ephemeral=True
+            )
+            return
+
+        if action.lower() == "capture":
+            if not node_id:
+                await interaction.response.send_message(
+                    "The 'capture' action requires a node ID.",
+                    ephemeral=True
+                )
+                return
+
+            if node_id not in valid_node_ids:
+                await interaction.response.send_message(
+                    f"Invalid node ID: `{node_id}`. Please select a valid ID from the list.",
+                    ephemeral=True
+                )
+                return
+
+            code = f"{random.randint(0, 0xFFFF):04X}"
+            MESH_SESSION.pending_captures[node_id] = {"code": code, "discord_user": interaction.user}
+            await interaction.response.send_message(
+                f"Node `{node_id}` capture started. Code: `{code}`\nSend this exact code back to confirm."
+            )
+            MESH_SESSION.save_capture_state() # store current state of things to disk
+
+        # handle status query
+        elif action.lower() == "status":
+            active_nodes = [
+                nid
+                for nid, user_id in MESH_SESSION.active_captures.items()
+                if user_id == interaction.user.id
+            ]
+
+            pending_nodes = [
+                nid
+                for nid, entry in MESH_SESSION.pending_captures.items()
+                if entry["discord_user_id"] == interaction.user.id
+            ]
+
+            if not active_nodes and not pending_nodes:
+                await interaction.response.send_message(
+                    "You do not have any active or pending node captures.",
+                    ephemeral=True
+                )
+                return
+
+            status_lines = []
+
+            if active_nodes:
+                status_lines.append("Active captures:")
+                status_lines.extend(f"- `{nid}`" for nid in active_nodes)
+
+            if pending_nodes:
+                status_lines.append("Pending captures:")
+                status_lines.extend(f"- `{nid}`" for nid in pending_nodes)
+
+            await interaction.response.send_message(
+                "\n".join(status_lines),
+                ephemeral=True
+            )
+            return
+
+        # handle clear active & pending for user
+        elif action.lower() == "clear":
+            cleared_active = []
+            cleared_pending = []
+
+            try:
+                for nid, user_id in list(MESH_SESSION.active_captures.items()):
+                    if user_id == interaction.user.id:
+                        del MESH_SESSION.active_captures[nid]
+                        cleared_active.append(nid)
+                        MESH_SESSION.save_capture_state() # store current state of things to disk
+
+                for nid, entry in list(MESH_SESSION.pending_captures.items()):
+                    if entry["discord_user_id"] == interaction.user.id:
+                        del MESH_SESSION.pending_captures[nid]
+                        cleared_pending.append(nid)
+                        MESH_SESSION.save_capture_state() # store current state of things to disk
+
+            except Exception as e:
+                await interaction.response.send_message(
+                    f"Error while clearing captures: {e}",
+                    ephemeral=True
+                )
+                return
+
+            if not cleared_active and not cleared_pending:
+                await interaction.response.send_message(
+                    "No active or pending captures were found for your user.",
+                    ephemeral=True
+                )
+                return
+
+            report = "Cleared captures:\n"
+
+            if cleared_active:
+                report += "Active:\n" + "\n".join(f"- `{nid}`" for nid in cleared_active) + "\n"
+
+            if cleared_pending:
+                report += "Pending:\n" + "\n".join(f"- `{nid}`" for nid in cleared_pending)
+
+            await interaction.response.send_message(report, ephemeral=True)
+            return
+
+        else:
+            await interaction.response.send_message("Unknown action or missing node_id.")
+
+
+
+
 
 
     @bot.tree.command(name="nodes_local", description="Show cached local nodedb", guild=guild_obj)
@@ -973,7 +1208,7 @@ async def register_commands():
                     f"`  First Seen: {first_seen_dt.strftime('%Y-%m-%d %H:%M:%S UTC')} ({first_hours_ago} hours ago)` \n"
                 )
 
-            # send discord-safe chunks
+            # send discord-safe chunk sizes
             current_chunk = header
             for line in lines:
                 if len(current_chunk) + len(line) + 1 > 2000:
@@ -994,7 +1229,6 @@ async def register_commands():
 
 
 
-
 @bot.event
 async def on_message(message):
     if message.author == bot.user:
@@ -1011,13 +1245,14 @@ async def on_message(message):
 async def on_ready():
     print(f"Logged in as {bot.user}!")
     await register_commands()
-    await bot.tree.sync(guild=discord.Object(id=GUILD_ID)) # sync the slash commands
+    # await bot.tree.sync(guild=discord.Object(id=GUILD_ID)) # sync the guild slash commands
+    await bot.tree.sync()  # global sync
     print("Commands synced!")
     
 
 # ====== START MESH SESSION ======
 MESH_SESSION = MeshSession(host)
-
+MESH_SESSION.load_capture_state() # load the DM capture active/pending list - for testing
 
 # Run Discord bot
 bot.run(TOKEN)
